@@ -1,0 +1,155 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+
+// Wi-Fi credentials
+const char* ssid = "Sudin";           // Replace with your SSID
+const char* password = "whysudinwhy"; // Replace with your Wi-Fi password
+
+// Firebase credentials
+#define FIREBASE_HOST "rfid-access-system-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "AIzaSyDwgMwv83P_KT9Q6SijKgh9CSMOuGTiNtc"  // Replace with your Firebase Database Secret
+
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Pin definitions
+#define SS_PIN 5
+#define RST_PIN 22
+#define SERVO_PIN 15
+#define BUZZER_PIN 13
+const int ledPin = 0; // Pin where the LED is connected (GPIO 0)
+
+MFRC522 rfid(SS_PIN, RST_PIN); // Instance of the class
+MFRC522::MIFARE_Key key;
+Servo myServo;
+
+byte nuidPICC[4] = {0x63, 0xAF, 0x1F, 0xFB}; // Predefined RFID tag NUID
+
+void setup() {
+  // Initialize the LED pin as an output
+  pinMode(ledPin, OUTPUT);
+  // Initially turn off the LED
+  digitalWrite(ledPin, LOW);
+
+  // Begin serial communication at a baud rate of 115200
+  Serial.begin(115200);
+
+  // Start the Wi-Fi connection
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+
+  // Initialize Firebase
+  config.database_url = FIREBASE_HOST;
+  config.api_key = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);  // Pass pointers to Firebase.begin()
+  Firebase.reconnectWiFi(true);
+
+  // Initialize RFID and servo
+  SPI.begin(); // Init SPI bus
+  rfid.PCD_Init(); // Init MFRC522
+  myServo.attach(SERVO_PIN); // Attach the servo to the specified pin
+  pinMode(BUZZER_PIN, OUTPUT); // Set buzzer pin as output
+
+  // Set default servo position
+  myServo.write(0); // Start with servo at 0 degrees
+
+  // Set the key to 0xFF
+  for (byte i = 0; i < 6; i++) {
+    key.keyByte[i] = 0xFF;
+  }
+
+  Serial.println(F("Scan an RFID tag to test."));
+}
+
+void loop() {
+  // Check Wi-Fi connection status and control the LED
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(ledPin, HIGH); // Keep the LED on if connected
+  } else {
+    digitalWrite(ledPin, LOW);  // Turn the LED off if disconnected
+  }
+
+  // Check if a new card is present and its NUID is read
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    Serial.println("Card detected.");
+
+    bool authorized = isAuthorizedCard();
+
+    // Save data to Firebase
+    saveToFirebase(authorized);
+
+    if (authorized) {
+      Serial.println("Authorized card detected.");
+      rotateServo();
+    } else {
+      Serial.println("Unauthorized card detected.");
+      beepBuzzer();
+    }
+
+    // Halt PICC and stop encryption on PCD
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+}
+
+// Function to check if the detected RFID card is authorized
+bool isAuthorizedCard() {
+  return (rfid.uid.uidByte[0] == nuidPICC[0] && 
+          rfid.uid.uidByte[1] == nuidPICC[1] && 
+          rfid.uid.uidByte[2] == nuidPICC[2] && 
+          rfid.uid.uidByte[3] == nuidPICC[3]);
+}
+
+// Function to rotate the servo
+void rotateServo() {
+  Serial.println(F("Rotating servo to 90 degrees."));
+  myServo.write(90); // Rotate the servo to 90 degrees
+  delay(1000); // Keep the servo in position for 1 second
+  Serial.println(F("Returning servo to 0 degrees."));
+  myServo.write(0); // Return the servo to 0 degrees
+}
+
+// Function to beep the buzzer
+void beepBuzzer() {
+  Serial.println(F("Beeping buzzer."));
+  tone(BUZZER_PIN, 1000); // Beep the buzzer at 1000Hz
+  delay(500); // Buzzer on for 500ms
+  noTone(BUZZER_PIN); // Stop the buzzer
+}
+
+// Function to save RFID data to Firebase
+void saveToFirebase(bool authorized) {
+  String uidStr = String(rfid.uid.uidByte[0], HEX) + 
+                  String(rfid.uid.uidByte[1], HEX) + 
+                  String(rfid.uid.uidByte[2], HEX) + 
+                  String(rfid.uid.uidByte[3], HEX);
+  
+  // Generate a timestamp (you can get this from an RTC module or NTP server)
+  String timestamp = String(millis());
+
+  // Path to store the log data in the database
+  String path = "/RFID_logs/" + timestamp;
+
+  // JSON structure for the log entry
+  String jsonData = "{\"UID\":\"" + uidStr + 
+                    "\",\"Authorized\":\"" + (authorized ? "true" : "false") + 
+                    "\",\"Timestamp\":\"" + timestamp + "\"}";
+
+  // Save the JSON data to Firebase
+  if (Firebase.setString(firebaseData, path.c_str(), jsonData)) {
+    Serial.println("Log data saved to Firebase");
+  } else {
+    Serial.println("Failed to save log data to Firebase");
+    Serial.println(firebaseData.errorReason());
+  }
+}
